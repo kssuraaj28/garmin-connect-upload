@@ -91,12 +91,14 @@ def collect_files(args: list[str]) -> list[Path]:
 
 
 def clean_payload(payload: dict) -> None:
-    """Mutates `payload` in place: strips server-generated fields and nulls
-    every nested stepId, so Garmin treats it as a fresh workout."""
+    """Mutates `payload` in place: strips server-generated fields, nulls
+    every nested stepId, and appends a target-pace summary to the workout
+    description so the notes show what each step is targeting."""
     for key in STRIP_FIELDS:
         payload.pop(key, None)
 
     _null_step_ids(payload)
+    _append_pace_notes(payload)
 
 
 def _null_step_ids(node) -> None:
@@ -111,6 +113,50 @@ def _null_step_ids(node) -> None:
     elif isinstance(node, list):
         for item in node:
             _null_step_ids(item)
+
+
+def _append_pace_notes(payload: dict) -> None:
+    """Collect per-step pace targets and append them to payload['description'].
+
+    Garmin stores pace as speed in m/s (targetValueLow = slower bound,
+    targetValueHigh = faster bound). We convert to min:ss/km so the notes
+    field actually shows a pace humans read."""
+    lines: list[str] = []
+    _collect_pace_lines(payload, lines)
+    if not lines:
+        return
+    summary = "Target paces (min/km):\n" + "\n".join(lines)
+    existing = payload.get("description") or ""
+    payload["description"] = f"{existing}\n\n{summary}".strip() if existing else summary
+
+
+def _collect_pace_lines(node, lines: list[str]) -> None:
+    if isinstance(node, dict):
+        target = node.get("targetType")
+        key = target.get("workoutTargetTypeKey") if isinstance(target, dict) else None
+        if key == "pace.zone":
+            lo = _pace_str(node.get("targetValueLow"))
+            hi = _pace_str(node.get("targetValueHigh"))
+            order = node.get("stepOrder")
+            step_type = (node.get("stepType") or {}).get("stepTypeKey", "step")
+            # m/s low = slower = bigger min/km number, so show hi-lo.
+            rng = f"{hi}-{lo}" if lo and hi else (lo or hi)
+            if rng:
+                label = f"Step {order}" if order is not None else "Step"
+                lines.append(f"{label} ({step_type}): {rng}")
+        for v in node.values():
+            _collect_pace_lines(v, lines)
+    elif isinstance(node, list):
+        for item in node:
+            _collect_pace_lines(item, lines)
+
+
+def _pace_str(speed_mps) -> str:
+    if not isinstance(speed_mps, (int, float)) or speed_mps <= 0:
+        return ""
+    sec_per_km = 1000.0 / float(speed_mps)
+    m, s = divmod(int(round(sec_per_km)), 60)
+    return f"{m}:{s:02d}"
 
 
 async def is_authenticated(browser) -> bool:
