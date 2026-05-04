@@ -1,12 +1,11 @@
 """
-Upload Garmin Connect structured-workout JSON files using zendriver.
+Upload a Garmin Connect structured-workout JSON file using zendriver.
 
 Usage:
-    python upload_workouts.py path/to/workout.json [more.json ...]
-    python upload_workouts.py path/to/dir_of_json/
+    python upload_workouts.py path/to/workout.json
 
 Opens a real Chrome window via zendriver, waits for you to finish logging in
-to Garmin Connect, then POSTs each workout to the workout-service endpoint
+to Garmin Connect, then POSTs the workout to the workout-service endpoint
 from *inside* the authenticated page context. The request mirrors what the
 "share-your-garmin-workout" Chrome extension does:
 
@@ -36,17 +35,6 @@ PROFILE_DIR = Path(__file__).resolve().parent / ".profile"
 # Garmin sets one of these on connect.garmin.com once SSO completes.
 AUTH_COOKIES = {"SESSIONID", "GARMIN-SSO-GUID"}
 
-# Fields the extension strips before re-posting an exported workout.
-STRIP_FIELDS = (
-    "workoutId",
-    "ownerId",
-    "updatedDate",
-    "createdDate",
-    "author",
-    "estimatedDurationInSecs",
-    "estimatedDistanceInMeters",
-)
-
 # JS runs inside the authenticated page. Reads the CSRF token from the meta
 # tag (same way the extension does) and POSTs the payload. Returns
 # {ok, status, body} so Python can log success/failure.
@@ -75,88 +63,6 @@ POST_WORKOUT_JS = """
     return { ok: res.ok, status: res.status, body };
 })()
 """
-
-
-def collect_files(args: list[str]) -> list[Path]:
-    files: list[Path] = []
-    for a in args:
-        p = Path(a)
-        if p.is_dir():
-            files.extend(sorted(p.glob("*.json")))
-        elif p.is_file():
-            files.append(p)
-        else:
-            print(f"warning: skipping {a} (not a file or dir)", file=sys.stderr)
-    return files
-
-
-def clean_payload(payload: dict) -> None:
-    """Mutates `payload` in place: strips server-generated fields, nulls
-    every nested stepId, and appends a target-pace summary to the workout
-    description so the notes show what each step is targeting."""
-    for key in STRIP_FIELDS:
-        payload.pop(key, None)
-
-    _null_step_ids(payload)
-    _append_pace_notes(payload)
-
-
-def _null_step_ids(node) -> None:
-    """Recursively set every stepId field to null. Garmin nests steps inside
-    workoutSegments[].workoutSteps[], and repeat/group steps contain further
-    nested workoutSteps, so we walk the whole tree."""
-    if isinstance(node, dict):
-        if "stepId" in node:
-            node["stepId"] = None
-        for v in node.values():
-            _null_step_ids(v)
-    elif isinstance(node, list):
-        for item in node:
-            _null_step_ids(item)
-
-
-def _append_pace_notes(payload: dict) -> None:
-    """Collect per-step pace targets and append them to payload['description'].
-
-    Garmin stores pace as speed in m/s (targetValueLow = slower bound,
-    targetValueHigh = faster bound). We convert to min:ss/km so the notes
-    field actually shows a pace humans read."""
-    lines: list[str] = []
-    _collect_pace_lines(payload, lines)
-    if not lines:
-        return
-    summary = "Target paces (min/km):\n" + "\n".join(lines)
-    existing = payload.get("description") or ""
-    payload["description"] = f"{existing}\n\n{summary}".strip() if existing else summary
-
-
-def _collect_pace_lines(node, lines: list[str]) -> None:
-    if isinstance(node, dict):
-        target = node.get("targetType")
-        key = target.get("workoutTargetTypeKey") if isinstance(target, dict) else None
-        if key == "pace.zone":
-            lo = _pace_str(node.get("targetValueLow"))
-            hi = _pace_str(node.get("targetValueHigh"))
-            order = node.get("stepOrder")
-            step_type = (node.get("stepType") or {}).get("stepTypeKey", "step")
-            # m/s low = slower = bigger min/km number, so show hi-lo.
-            rng = f"{hi}-{lo}" if lo and hi else (lo or hi)
-            if rng:
-                label = f"Step {order}" if order is not None else "Step"
-                lines.append(f"{label} ({step_type}): {rng}")
-        for v in node.values():
-            _collect_pace_lines(v, lines)
-    elif isinstance(node, list):
-        for item in node:
-            _collect_pace_lines(item, lines)
-
-
-def _pace_str(speed_mps) -> str:
-    if not isinstance(speed_mps, (int, float)) or speed_mps <= 0:
-        return ""
-    sec_per_km = 1000.0 / float(speed_mps)
-    m, s = divmod(int(round(sec_per_km)), 60)
-    return f"{m}:{s:02d}"
 
 
 async def is_authenticated(browser) -> bool:
@@ -196,58 +102,51 @@ async def wait_for_login(browser, grace_period: float = 5.0) -> None:
         await asyncio.sleep(1)
 
 
-async def upload_one(page, workout_file: Path) -> bool:
-    try:
-        payload = json.loads(workout_file.read_text())
-    except Exception as e:
-        print(f"[SKIP] {workout_file.name}: invalid JSON ({e})")
-        return False
-
-    clean_payload(payload)
-    js = POST_WORKOUT_JS % (json.dumps(payload), WORKOUT_ENDPOINT)
-    result = await page.evaluate(js, await_promise=True, return_by_value=True)
-
-    print(f"--- {workout_file.name} ---")
-    if isinstance(result, dict) and result.get("ok"):
-        body = result.get("body") or {}
-        wid = body.get("workoutId") if isinstance(body, dict) else None
-        print(f"[ OK ] status={result.get('status')} workoutId={wid}")
-        return True
-
-    print(f"[FAIL] {workout_file.name}")
-    print(f"  result: {str(result)[:800]}")
-    return False
-
-
-async def main(argv: list[str]) -> int:
-    if not argv:
-        print(__doc__)
-        return 2
-
-    files = collect_files(argv)
-    if not files:
-        print("no .json files found", file=sys.stderr)
-        return 2
+async def main(workout_file: Path) -> int:
+    payload = json.loads(workout_file.read_text())
 
     PROFILE_DIR.mkdir(exist_ok=True)
     browser = await zd.start(headless=False, user_data_dir=str(PROFILE_DIR))
+    page = None
     try:
+        print("navigating to workouts page")
         page = await browser.get(WORKOUTS_PAGE)
+
+        print("waiting for login")
         await wait_for_login(browser)
+
         # After login we may have been redirected through SSO; land back on
         # /modern/workouts so the csrf-token meta tag is guaranteed present.
+        print("navigating back to workouts page")
         await page.get(WORKOUTS_PAGE)
         await wait_for_csrf_token(page)
 
-        ok = 0
-        for f in files:
-            if await upload_one(page, f):
-                ok += 1
-        print(f"\nDone: {ok}/{len(files)} uploaded.")
-        return 0 if ok == len(files) else 1
+        print("POSTing workout")
+        js = POST_WORKOUT_JS % (json.dumps(payload), WORKOUT_ENDPOINT)
+        result = await page.evaluate(js, await_promise=True, return_by_value=True)
+
+        if isinstance(result, dict) and result.get("ok"):
+            body = result.get("body") or {}
+            wid = body.get("workoutId") if isinstance(body, dict) else None
+            print(f"[ OK ] status={result.get('status')} workoutId={wid}")
+            return 0
+
+        print(f"[FAIL] {workout_file.name}")
+        print(f"  result: {result}")
+        return 1
     finally:
+        print("stopping browser")
+        if page is not None:
+            await page.close()
         await browser.stop()
 
 
 if __name__ == "__main__":
-    sys.exit(asyncio.run(main(sys.argv[1:])))
+    if len(sys.argv) != 2:
+        print(__doc__)
+        sys.exit(2)
+    path = Path(sys.argv[1])
+    if not path.is_file():
+        print(f"not a file: {path}", file=sys.stderr)
+        sys.exit(2)
+    sys.exit(asyncio.run(main(path)))
